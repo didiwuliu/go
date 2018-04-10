@@ -52,7 +52,7 @@ func TestXadduintptr(t *testing.T) {
 // Tests that xadduintptr correctly updates 64-bit values. The place where
 // we actually do so is mstats.go, functions mSysStat{Inc,Dec}.
 func TestXadduintptrOnUint64(t *testing.T) {
-	if sys.BigEndian != 0 {
+	if sys.BigEndian {
 		// On big endian architectures, we never use xadduintptr to update
 		// 64-bit values and hence we skip the test.  (Note that functions
 		// mSysStat{Inc,Dec} in mstats.go have explicit checks for
@@ -87,10 +87,8 @@ func TestUnaligned64(t *testing.T) {
 		if unsafe.Sizeof(int(0)) != 4 {
 			t.Skip("test only runs on 32-bit systems")
 		}
-	case "arm":
-		t.Skipf("TODO: implement. golang.org/issue/17786")
-	case "amd64p32", "mips", "mipsle":
-		// amd64p32 and mips can handle unaligned atomics.
+	case "amd64p32":
+		// amd64p32 can handle unaligned atomics.
 		t.Skipf("test not needed on %v", runtime.GOARCH)
 	}
 
@@ -101,4 +99,7 @@ func TestUnaligned64(t *testing.T) {
 	shouldPanic(t, "Load64", func() { atomic.Load64(up64) })
 	shouldPanic(t, "Loadint64", func() { atomic.Loadint64(p64) })
 	shouldPanic(t, "Store64", func() { atomic.Store64(up64, 0) })
+	shouldPanic(t, "Xadd64", func() { atomic.Xadd64(up64, 1) })
+	shouldPanic(t, "Xchg64", func() { atomic.Xchg64(up64, 1) })
+	shouldPanic(t, "Cas64", func() { atomic.Cas64(up64, 1, 2) })
 }

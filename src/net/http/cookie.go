@@ -5,7 +5,6 @@
 package http
 
 import (
-	"bytes"
 	"log"
 	"net"
 	"strconv"
@@ -143,7 +142,7 @@ func (c *Cookie) String() string {
 	if c == nil || !isCookieNameValid(c.Name) {
 		return ""
 	}
-	var b bytes.Buffer
+	var b strings.Builder
 	b.WriteString(sanitizeCookieName(c.Name))
 	b.WriteRune('=')
 	b.WriteString(sanitizeCookieValue(c.Value))
@@ -168,17 +167,14 @@ func (c *Cookie) String() string {
 			log.Printf("net/http: invalid Cookie.Domain %q; dropping domain attribute", c.Domain)
 		}
 	}
+	var buf [len(TimeFormat)]byte
 	if validCookieExpires(c.Expires) {
 		b.WriteString("; Expires=")
-		b2 := b.Bytes()
-		b.Reset()
-		b.Write(c.Expires.UTC().AppendFormat(b2, TimeFormat))
+		b.Write(c.Expires.UTC().AppendFormat(buf[:0], TimeFormat))
 	}
 	if c.MaxAge > 0 {
 		b.WriteString("; Max-Age=")
-		b2 := b.Bytes()
-		b.Reset()
-		b.Write(strconv.AppendInt(b2, int64(c.MaxAge), 10))
+		b.Write(strconv.AppendInt(buf[:0], int64(c.MaxAge), 10))
 	} else if c.MaxAge < 0 {
 		b.WriteString("; Max-Age=0")
 	}
@@ -208,7 +204,6 @@ func readCookies(h Header, filter string) []*Cookie {
 			continue
 		}
 		// Per-line attributes
-		parsedPairs := 0
 		for i := 0; i < len(parts); i++ {
 			parts[i] = strings.TrimSpace(parts[i])
 			if len(parts[i]) == 0 {
@@ -229,7 +224,6 @@ func readCookies(h Header, filter string) []*Cookie {
 				continue
 			}
 			cookies = append(cookies, &Cookie{Name: name, Value: val})
-			parsedPairs++
 		}
 	}
 	return cookies
@@ -328,7 +322,7 @@ func sanitizeCookieValue(v string) string {
 	if len(v) == 0 {
 		return v
 	}
-	if v[0] == ' ' || v[0] == ',' || v[len(v)-1] == ' ' || v[len(v)-1] == ',' {
+	if strings.IndexByte(v, ' ') >= 0 || strings.IndexByte(v, ',') >= 0 {
 		return `"` + v + `"`
 	}
 	return v

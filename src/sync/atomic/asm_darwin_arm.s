@@ -36,7 +36,7 @@ TEXT ·SwapUintptr(SB),NOSPLIT,$0
 TEXT ·CompareAndSwapInt64(SB),NOSPLIT,$0
 	B ·CompareAndSwapUint64(SB)
 
-TEXT ·CompareAndSwapUint64(SB),NOSPLIT,$-4
+TEXT ·CompareAndSwapUint64(SB),NOSPLIT|NOFRAME,$0
 	B ·armCompareAndSwapUint64(SB)
 
 TEXT ·AddInt64(SB),NOSPLIT,$0
@@ -58,9 +58,11 @@ TEXT ·LoadUint32(SB),NOSPLIT,$0-8
 	MOVW addr+0(FP), R1
 load32loop:
 	LDREX (R1), R2		// loads R2
+	DMB MB_ISHST
 	STREX R2, (R1), R0	// stores R2
 	CMP $0, R0
 	BNE load32loop
+	DMB MB_ISH
 	MOVW R2, val+4(FP)
 	RET
 
@@ -84,9 +86,11 @@ TEXT ·StoreUint32(SB),NOSPLIT,$0-8
 	MOVW val+4(FP), R2
 storeloop:
 	LDREX (R1), R4		// loads R4
+	DMB MB_ISHST
 	STREX R2, (R1), R0	// stores R2
 	CMP $0, R0
 	BNE storeloop
+	DMB MB_ISH
 	RET
 
 TEXT ·StoreInt64(SB),NOSPLIT,$0

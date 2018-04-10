@@ -91,6 +91,7 @@ var sniffSignatures = []sniffSig{
 		ct:   "image/webp",
 	},
 	&exactSig{[]byte("\x00\x00\x01\x00"), "image/vnd.microsoft.icon"},
+
 	&maskedSig{
 		mask: []byte("\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF"),
 		pat:  []byte("RIFF\x00\x00\x00\x00WAVE"),
@@ -107,8 +108,8 @@ var sniffSignatures = []sniffSig{
 		ct:   "audio/basic",
 	},
 	&maskedSig{
-		mask: []byte("OggS\x00"),
-		pat:  []byte("\x4F\x67\x67\x53\x00"),
+		mask: []byte("\xFF\xFF\xFF\xFF\xFF"),
+		pat:  []byte("OggS\x00"),
 		ct:   "application/ogg",
 	},
 	&maskedSig{
@@ -126,6 +127,21 @@ var sniffSignatures = []sniffSig{
 		pat:  []byte("RIFF\x00\x00\x00\x00AVI "),
 		ct:   "video/avi",
 	},
+
+	// Fonts
+	&maskedSig{
+		// 34 NULL bytes followed by the string "LP"
+		pat: []byte("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x4C\x50"),
+		// 34 NULL bytes followed by \xF\xF
+		mask: []byte("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xFF\xFF"),
+		ct:   "application/vnd.ms-fontobject",
+	},
+	&exactSig{[]byte("\x00\x01\x00\x00"), "font/ttf"},
+	&exactSig{[]byte("OTTO"), "font/otf"},
+	&exactSig{[]byte("ttcf"), "font/collection"},
+	&exactSig{[]byte("wOFF"), "font/woff"},
+	&exactSig{[]byte("wOF2"), "font/woff2"},
+
 	&exactSig{[]byte("\x1A\x45\xDF\xA3"), "video/webm"},
 	&exactSig{[]byte("\x52\x61\x72\x20\x1A\x07\x00"), "application/x-rar-compressed"},
 	&exactSig{[]byte("\x50\x4B\x03\x04"), "application/zip"},

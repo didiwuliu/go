@@ -39,6 +39,9 @@ var _ = log.Printf
 // Any of these can be preceded by PANIC|<method>|, to cause the
 // named method on fakeStmt to panic.
 //
+// Any of these can be proceeded by WAIT|<duration>|, to cause the
+// named method on fakeStmt to sleep for the specified duration.
+//
 // Multiple of these can be combined when separated with a semicolon.
 //
 // When opening a fakeDriver's database, it starts empty with no
@@ -52,12 +55,39 @@ type fakeDriver struct {
 	dbs        map[string]*fakeDB
 }
 
+type fakeConnector struct {
+	name string
+
+	waiter func(context.Context)
+}
+
+func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := fdriver.Open(c.name)
+	conn.(*fakeConn).waiter = c.waiter
+	return conn, err
+}
+
+func (c *fakeConnector) Driver() driver.Driver {
+	return fdriver
+}
+
+type fakeDriverCtx struct {
+	fakeDriver
+}
+
+var _ driver.DriverContext = &fakeDriverCtx{}
+
+func (cc *fakeDriverCtx) OpenConnector(name string) (driver.Connector, error) {
+	return &fakeConnector{name: name}, nil
+}
+
 type fakeDB struct {
 	name string
 
-	mu      sync.Mutex
-	tables  map[string]*table
-	badConn bool
+	mu       sync.Mutex
+	tables   map[string]*table
+	badConn  bool
+	allowAny bool
 }
 
 type table struct {
@@ -80,10 +110,19 @@ type row struct {
 	cols []interface{} // must be same size as its table colname + coltype
 }
 
+type memToucher interface {
+	// touchMem reads & writes some memory, to help find data races.
+	touchMem()
+}
+
 type fakeConn struct {
 	db *fakeDB // where to return ourselves to
 
 	currTx *fakeTx
+
+	// Every operation writes to line to enable the race detector
+	// check for data races.
+	line int64
 
 	// Stats for tests:
 	mu          sync.Mutex
@@ -94,6 +133,20 @@ type fakeConn struct {
 	// bad connection tests; see isBad()
 	bad       bool
 	stickyBad bool
+
+	skipDirtySession bool // tests that use Conn should set this to true.
+
+	// dirtySession tests ResetSession, true if a query has executed
+	// until ResetSession is called.
+	dirtySession bool
+
+	// The waiter is called before each query. May be used in place of the "WAIT"
+	// directive.
+	waiter func(context.Context)
+}
+
+func (c *fakeConn) touchMem() {
+	c.line++
 }
 
 func (c *fakeConn) incrStat(v *int) {
@@ -113,12 +166,14 @@ type boundCol struct {
 }
 
 type fakeStmt struct {
+	memToucher
 	c *fakeConn
 	q string // just for debugging
 
 	cmd   string
 	table string
 	panic string
+	wait  time.Duration
 
 	next *fakeStmt // used for returning multiple results.
 
@@ -279,12 +334,30 @@ func (c *fakeConn) isBad() bool {
 	if c.stickyBad {
 		return true
 	} else if c.bad {
+		if c.db == nil {
+			return false
+		}
 		// alternate between bad conn and not bad conn
 		c.db.badConn = !c.db.badConn
 		return c.db.badConn
 	} else {
 		return false
 	}
+}
+
+func (c *fakeConn) isDirtyAndMark() bool {
+	if c.skipDirtySession {
+		return false
+	}
+	if c.currTx != nil {
+		c.dirtySession = true
+		return false
+	}
+	if c.dirtySession {
+		return true
+	}
+	c.dirtySession = true
+	return false
 }
 
 func (c *fakeConn) Begin() (driver.Tx, error) {
@@ -294,6 +367,7 @@ func (c *fakeConn) Begin() (driver.Tx, error) {
 	if c.currTx != nil {
 		return nil, errors.New("already in a transaction")
 	}
+	c.touchMem()
 	c.currTx = &fakeTx{c: c}
 	return c.currTx, nil
 }
@@ -317,6 +391,14 @@ func setStrictFakeConnClose(t *testing.T) {
 	testStrictClose = t
 }
 
+func (c *fakeConn) ResetSession(ctx context.Context) error {
+	c.dirtySession = false
+	if c.isBad() {
+		return driver.ErrBadConn
+	}
+	return nil
+}
+
 func (c *fakeConn) Close() (err error) {
 	drv := fdriver.(*fakeDriver)
 	defer func() {
@@ -335,6 +417,7 @@ func (c *fakeConn) Close() (err error) {
 			drv.mu.Unlock()
 		}
 	}()
+	c.touchMem()
 	if c.currTx != nil {
 		return errors.New("can't close fakeConn; in a Transaction")
 	}
@@ -348,12 +431,14 @@ func (c *fakeConn) Close() (err error) {
 	return nil
 }
 
-func checkSubsetTypes(args []driver.NamedValue) error {
+func checkSubsetTypes(allowAny bool, args []driver.NamedValue) error {
 	for _, arg := range args {
 		switch arg.Value.(type) {
 		case int64, float64, bool, nil, []byte, string, time.Time:
 		default:
-			return fmt.Errorf("fakedb_test: invalid argument ordinal %[1]d: %[2]v, type %[2]T", arg.Ordinal, arg.Value)
+			if !allowAny {
+				return fmt.Errorf("fakedb_test: invalid argument ordinal %[1]d: %[2]v, type %[2]T", arg.Ordinal, arg.Value)
+			}
 		}
 	}
 	return nil
@@ -369,7 +454,7 @@ func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.
 	// just to check that all the args are of the proper types.
 	// ErrSkip is returned so the caller acts as if we didn't
 	// implement this at all.
-	err := checkSubsetTypes(args)
+	err := checkSubsetTypes(c.db.allowAny, args)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +471,7 @@ func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver
 	// just to check that all the args are of the proper types.
 	// ErrSkip is returned so the caller acts as if we didn't
 	// implement this at all.
-	err := checkSubsetTypes(args)
+	err := checkSubsetTypes(c.db.allowAny, args)
 	if err != nil {
 		return nil, err
 	}
@@ -507,6 +592,10 @@ func (c *fakeConn) prepareInsert(stmt *fakeStmt, parts []string) (*fakeStmt, err
 var hookPrepareBadConn func() bool
 
 func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
+	panic("use PrepareContext")
+}
+
+func (c *fakeConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	c.numPrepare++
 	if c.db == nil {
 		panic("nil c.db; conn = " + fmt.Sprintf("%#v", c))
@@ -516,23 +605,48 @@ func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
 		return nil, driver.ErrBadConn
 	}
 
+	c.touchMem()
 	var firstStmt, prev *fakeStmt
 	for _, query := range strings.Split(query, ";") {
 		parts := strings.Split(query, "|")
 		if len(parts) < 1 {
 			return nil, errf("empty query")
 		}
-		stmt := &fakeStmt{q: query, c: c}
+		stmt := &fakeStmt{q: query, c: c, memToucher: c}
 		if firstStmt == nil {
 			firstStmt = stmt
 		}
-		if len(parts) >= 3 && parts[0] == "PANIC" {
-			stmt.panic = parts[1]
-			parts = parts[2:]
+		if len(parts) >= 3 {
+			switch parts[0] {
+			case "PANIC":
+				stmt.panic = parts[1]
+				parts = parts[2:]
+			case "WAIT":
+				wait, err := time.ParseDuration(parts[1])
+				if err != nil {
+					return nil, errf("expected section after WAIT to be a duration, got %q %v", parts[1], err)
+				}
+				parts = parts[2:]
+				stmt.wait = wait
+			}
 		}
 		cmd := parts[0]
 		stmt.cmd = cmd
 		parts = parts[1:]
+
+		if c.waiter != nil {
+			c.waiter(ctx)
+		}
+
+		if stmt.wait > 0 {
+			wait := time.NewTimer(stmt.wait)
+			select {
+			case <-wait.C:
+			case <-ctx.Done():
+				wait.Stop()
+				return nil, ctx.Err()
+			}
+		}
 
 		c.incrStat(&c.stmtsMade)
 		var err error
@@ -584,6 +698,7 @@ func (s *fakeStmt) Close() error {
 	if s.c.db == nil {
 		panic("in fakeStmt.Close, conn's db is nil (already closed)")
 	}
+	s.touchMem()
 	if !s.closed {
 		s.c.incrStat(&s.c.stmtsClosed)
 		s.closed = true
@@ -613,10 +728,24 @@ func (s *fakeStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 	if s.c.stickyBad || (hookExecBadConn != nil && hookExecBadConn()) {
 		return nil, driver.ErrBadConn
 	}
+	if s.c.isDirtyAndMark() {
+		return nil, errors.New("session is dirty")
+	}
 
-	err := checkSubsetTypes(args)
+	err := checkSubsetTypes(s.c.db.allowAny, args)
 	if err != nil {
 		return nil, err
+	}
+	s.touchMem()
+
+	if s.wait > 0 {
+		time.Sleep(s.wait)
+	}
+
+	select {
+	default:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
 	db := s.c.db
@@ -675,7 +804,7 @@ func (s *fakeStmt) execInsert(args []driver.NamedValue, doInsert bool) (driver.R
 			} else {
 				// Assign value from argument placeholder name.
 				for _, a := range args {
-					if a.Name == strvalue {
+					if a.Name == strvalue[1:] {
 						val = a.Value
 						break
 					}
@@ -714,12 +843,16 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 	if s.c.stickyBad || (hookQueryBadConn != nil && hookQueryBadConn()) {
 		return nil, driver.ErrBadConn
 	}
+	if s.c.isDirtyAndMark() {
+		return nil, errors.New("session is dirty")
+	}
 
-	err := checkSubsetTypes(args)
+	err := checkSubsetTypes(s.c.db.allowAny, args)
 	if err != nil {
 		return nil, err
 	}
 
+	s.touchMem()
 	db := s.c.db
 	if len(args) != s.placeholders {
 		panic("error in pkg db; should only get here if size is correct")
@@ -780,7 +913,7 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 				} else {
 					// Assign arg value from placeholder name.
 					for _, a := range args {
-						if a.Name == wcol.Placeholder {
+						if a.Name == wcol.Placeholder[1:] {
 							argValue = a.Value
 							break
 						}
@@ -815,11 +948,12 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 	}
 
 	cursor := &rowsCursor{
-		posRow:  -1,
-		rows:    setMRows,
-		cols:    setColumns,
-		colType: setColType,
-		errPos:  -1,
+		parentMem: s.c,
+		posRow:    -1,
+		rows:      setMRows,
+		cols:      setColumns,
+		colType:   setColType,
+		errPos:    -1,
 	}
 	return cursor, nil
 }
@@ -839,6 +973,7 @@ func (tx *fakeTx) Commit() error {
 	if hookCommitBadConn != nil && hookCommitBadConn() {
 		return driver.ErrBadConn
 	}
+	tx.c.touchMem()
 	return nil
 }
 
@@ -850,33 +985,43 @@ func (tx *fakeTx) Rollback() error {
 	if hookRollbackBadConn != nil && hookRollbackBadConn() {
 		return driver.ErrBadConn
 	}
+	tx.c.touchMem()
 	return nil
 }
 
 type rowsCursor struct {
-	cols    [][]string
-	colType [][]string
-	posSet  int
-	posRow  int
-	rows    [][]*row
-	closed  bool
+	parentMem memToucher
+	cols      [][]string
+	colType   [][]string
+	posSet    int
+	posRow    int
+	rows      [][]*row
+	closed    bool
 
 	// errPos and err are for making Next return early with error.
 	errPos int
 	err    error
 
 	// a clone of slices to give out to clients, indexed by the
-	// the original slice's first byte address.  we clone them
+	// original slice's first byte address.  we clone them
 	// just so we're able to corrupt them on close.
 	bytesClone map[*byte][]byte
+
+	// Every operation writes to line to enable the race detector
+	// check for data races.
+	// This is separate from the fakeConn.line to allow for drivers that
+	// can start multiple queries on the same transaction at the same time.
+	line int64
+}
+
+func (rc *rowsCursor) touchMem() {
+	rc.parentMem.touchMem()
+	rc.line++
 }
 
 func (rc *rowsCursor) Close() error {
-	if !rc.closed {
-		for _, bs := range rc.bytesClone {
-			bs[0] = 255 // first byte corrupted
-		}
-	}
+	rc.touchMem()
+	rc.parentMem.touchMem()
 	rc.closed = true
 	return nil
 }
@@ -899,6 +1044,7 @@ func (rc *rowsCursor) Next(dest []driver.Value) error {
 	if rc.closed {
 		return errors.New("fakedb: cursor is closed")
 	}
+	rc.touchMem()
 	rc.posRow++
 	if rc.posRow == rc.errPos {
 		return rc.err
@@ -932,10 +1078,12 @@ func (rc *rowsCursor) Next(dest []driver.Value) error {
 }
 
 func (rc *rowsCursor) HasNextResultSet() bool {
+	rc.touchMem()
 	return rc.posSet < len(rc.rows)-1
 }
 
 func (rc *rowsCursor) NextResultSet() error {
+	rc.touchMem()
 	if rc.HasNextResultSet() {
 		rc.posSet++
 		rc.posRow = -1
@@ -966,6 +1114,12 @@ func (fakeDriverString) ConvertValue(v interface{}) (driver.Value, error) {
 	return fmt.Sprintf("%v", v), nil
 }
 
+type anyTypeConverter struct{}
+
+func (anyTypeConverter) ConvertValue(v interface{}) (driver.Value, error) {
+	return v, nil
+}
+
 func converterForType(typ string) driver.ValueConverter {
 	switch typ {
 	case "bool":
@@ -992,6 +1146,8 @@ func converterForType(typ string) driver.ValueConverter {
 		return driver.Null{Converter: driver.DefaultParameterConverter}
 	case "datetime":
 		return driver.DefaultParameterConverter
+	case "any":
+		return anyTypeConverter{}
 	}
 	panic("invalid fakedb column type of " + typ)
 }
@@ -1018,6 +1174,8 @@ func colTypeToReflectType(typ string) reflect.Type {
 		return reflect.TypeOf(NullFloat64{})
 	case "datetime":
 		return reflect.TypeOf(time.Time{})
+	case "any":
+		return reflect.TypeOf(new(interface{})).Elem()
 	}
 	panic("invalid fakedb column type of " + typ)
 }

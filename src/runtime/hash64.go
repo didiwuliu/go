@@ -21,7 +21,8 @@ const (
 )
 
 func memhash(p unsafe.Pointer, seed, s uintptr) uintptr {
-	if GOARCH == "amd64" && GOOS != "nacl" && useAeshash {
+	if (GOARCH == "amd64" || GOARCH == "arm64") &&
+		GOOS != "nacl" && useAeshash {
 		return aeshash(p, seed, s)
 	}
 	h := uint64(seed + s*hashkey[0])
@@ -75,6 +76,28 @@ tail:
 		goto tail
 	}
 
+	h ^= h >> 29
+	h *= m3
+	h ^= h >> 32
+	return uintptr(h)
+}
+
+func memhash32(p unsafe.Pointer, seed uintptr) uintptr {
+	h := uint64(seed + 4*hashkey[0])
+	v := uint64(readUnaligned32(p))
+	h ^= v
+	h ^= v << 32
+	h = rotl_31(h*m1) * m2
+	h ^= h >> 29
+	h *= m3
+	h ^= h >> 32
+	return uintptr(h)
+}
+
+func memhash64(p unsafe.Pointer, seed uintptr) uintptr {
+	h := uint64(seed + 8*hashkey[0])
+	h ^= uint64(readUnaligned32(p)) | uint64(readUnaligned32(add(p, 4)))<<32
+	h = rotl_31(h*m1) * m2
 	h ^= h >> 29
 	h *= m3
 	h ^= h >> 32

@@ -10,13 +10,13 @@ package driver
 
 import (
 	"context"
-	"database/sql/internal"
 	"errors"
 	"reflect"
 )
 
 // Value is a value that drivers must be able to handle.
-// It is either nil or an instance of one of these types:
+// It is either nil, a type handled by a database driver's NamedValueChecker
+// interface, or an instance of one of these types:
 //
 //   int64
 //   float64
@@ -27,17 +27,26 @@ import (
 type Value interface{}
 
 // NamedValue holds both the value name and value.
-// The Ordinal is the position of the parameter starting from one and is always set.
-// If the Name is not empty it should be used for the parameter identifier and
-// not the ordinal position.
 type NamedValue struct {
-	Name    string
+	// If the Name is not empty it should be used for the parameter identifier and
+	// not the ordinal position.
+	//
+	// Name will not have a symbol prefix.
+	Name string
+
+	// Ordinal position of the parameter starting from one and is always set.
 	Ordinal int
-	Value   Value
+
+	// Value is the parameter value.
+	Value Value
 }
 
 // Driver is the interface that must be implemented by a database
 // driver.
+//
+// Database drivers may implement DriverContext for access
+// to contexts and to parse the name only once for a pool of connections,
+// instead of once per connection.
 type Driver interface {
 	// Open returns a new connection to the database.
 	// The name is a string in a driver-specific format.
@@ -49,6 +58,47 @@ type Driver interface {
 	// The returned connection is only used by one goroutine at a
 	// time.
 	Open(name string) (Conn, error)
+}
+
+// If a Driver implements DriverContext, then sql.DB will call
+// OpenConnector to obtain a Connector and then invoke
+// that Connector's Conn method to obtain each needed connection,
+// instead of invoking the Driver's Open method for each connection.
+// The two-step sequence allows drivers to parse the name just once
+// and also provides access to per-Conn contexts.
+type DriverContext interface {
+	// OpenConnector must parse the name in the same format that Driver.Open
+	// parses the name parameter.
+	OpenConnector(name string) (Connector, error)
+}
+
+// A Connector represents a driver in a fixed configuration
+// and can create any number of equivalent Conns for use
+// by multiple goroutines.
+//
+// A Connector can be passed to sql.OpenDB, to allow drivers
+// to implement their own sql.DB constructors, or returned by
+// DriverContext's OpenConnector method, to allow drivers
+// access to context and to avoid repeated parsing of driver
+// configuration.
+type Connector interface {
+	// Connect returns a connection to the database.
+	// Connect may return a cached connection (one previously
+	// closed), but doing so is unnecessary; the sql package
+	// maintains a pool of idle connections for efficient re-use.
+	//
+	// The provided context.Context is for dialing purposes only
+	// (see net.DialContext) and should not be stored or used for
+	// other purposes.
+	//
+	// The returned connection is only used by one goroutine at a
+	// time.
+	Connect(context.Context) (Conn, error)
+
+	// Driver returns the underlying Driver of the Connector,
+	// mainly to maintain compatibility with the Driver method
+	// on sql.DB.
+	Driver() Driver
 }
 
 // ErrSkip may be returned by some optional interfaces' methods to
@@ -82,34 +132,54 @@ type Pinger interface {
 
 // Execer is an optional interface that may be implemented by a Conn.
 //
-// If a Conn does not implement Execer, the sql package's DB.Exec will
-// first prepare a query, execute the statement, and then close the
-// statement.
+// If a Conn implements neither ExecerContext nor Execer Execer,
+// the sql package's DB.Exec will first prepare a query, execute the statement,
+// and then close the statement.
 //
 // Exec may return ErrSkip.
+//
+// Deprecated: Drivers should implement ExecerContext instead.
 type Execer interface {
 	Exec(query string, args []Value) (Result, error)
 }
 
-// ExecerContext is like execer, but must honor the context timeout and return
-// when the context is cancelled.
+// ExecerContext is an optional interface that may be implemented by a Conn.
+//
+// If a Conn does not implement ExecerContext, the sql package's DB.Exec
+// will fall back to Execer; if the Conn does not implement Execer either,
+// DB.Exec will first prepare a query, execute the statement, and then
+// close the statement.
+//
+// ExecerContext may return ErrSkip.
+//
+// ExecerContext must honor the context timeout and return when the context is canceled.
 type ExecerContext interface {
 	ExecContext(ctx context.Context, query string, args []NamedValue) (Result, error)
 }
 
 // Queryer is an optional interface that may be implemented by a Conn.
 //
-// If a Conn does not implement Queryer, the sql package's DB.Query will
-// first prepare a query, execute the statement, and then close the
-// statement.
+// If a Conn implements neither QueryerContext nor Queryer,
+// the sql package's DB.Query will first prepare a query, execute the statement,
+// and then close the statement.
 //
 // Query may return ErrSkip.
+//
+// Deprecated: Drivers should implement QueryerContext instead.
 type Queryer interface {
 	Query(query string, args []Value) (Rows, error)
 }
 
-// QueryerContext is like Queryer, but most honor the context timeout and return
-// when the context is cancelled.
+// QueryerContext is an optional interface that may be implemented by a Conn.
+//
+// If a Conn does not implement QueryerContext, the sql package's DB.Query
+// will fall back to Queryer; if the Conn does not implement Queryer either,
+// DB.Query will first prepare a query, execute the statement, and then
+// close the statement.
+//
+// QueryerContext may return ErrSkip.
+//
+// QueryerContext must honor the context timeout and return when the context is canceled.
 type QueryerContext interface {
 	QueryContext(ctx context.Context, query string, args []NamedValue) (Rows, error)
 }
@@ -133,6 +203,8 @@ type Conn interface {
 	Close() error
 
 	// Begin starts and returns a new transaction.
+	//
+	// Deprecated: Drivers should implement ConnBeginTx instead (or additionally).
 	Begin() (Tx, error)
 }
 
@@ -144,41 +216,47 @@ type ConnPrepareContext interface {
 	PrepareContext(ctx context.Context, query string) (Stmt, error)
 }
 
-// IsolationLevel is the transaction isolation level stored in Context.
+// IsolationLevel is the transaction isolation level stored in TxOptions.
 //
 // This type should be considered identical to sql.IsolationLevel along
 // with any values defined on it.
 type IsolationLevel int
 
-// IsolationFromContext extracts the isolation level from a Context.
-func IsolationFromContext(ctx context.Context) (level IsolationLevel, ok bool) {
-	level, ok = ctx.Value(internal.IsolationLevelKey{}).(IsolationLevel)
-	return level, ok
+// TxOptions holds the transaction options.
+//
+// This type should be considered identical to sql.TxOptions.
+type TxOptions struct {
+	Isolation IsolationLevel
+	ReadOnly  bool
 }
 
-// ReadOnlyFromContext extracts the read-only property from a Context.
-// When readonly is true the transaction must be set to read-only
-// or return an error.
-func ReadOnlyFromContext(ctx context.Context) (readonly bool) {
-	readonly, _ = ctx.Value(internal.ReadOnlyKey{}).(bool)
-	return readonly
-}
-
-// ConnBeginContext enhances the Conn interface with context.
-type ConnBeginContext interface {
-	// BeginContext starts and returns a new transaction.
-	// The provided context should be used to roll the transaction back
-	// if it is cancelled.
+// ConnBeginTx enhances the Conn interface with context and TxOptions.
+type ConnBeginTx interface {
+	// BeginTx starts and returns a new transaction.
+	// If the context is canceled by the user the sql package will
+	// call Tx.Rollback before discarding and closing the connection.
 	//
-	// This must call IsolationFromContext to determine if there is a set
-	// isolation level. If the driver does not support setting the isolation
-	// level and one is set or if there is a set isolation level
-	// but the set level is not supported, an error must be returned.
+	// This must check opts.Isolation to determine if there is a set
+	// isolation level. If the driver does not support a non-default
+	// level and one is set or if there is a non-default isolation level
+	// that is not supported, an error must be returned.
 	//
-	// This must also call ReadOnlyFromContext to determine if the read-only
+	// This must also check opts.ReadOnly to determine if the read-only
 	// value is true to either set the read-only transaction property if supported
 	// or return an error if it is not supported.
-	BeginContext(ctx context.Context) (Tx, error)
+	BeginTx(ctx context.Context, opts TxOptions) (Tx, error)
+}
+
+// SessionResetter may be implemented by Conn to allow drivers to reset the
+// session state associated with the connection and to signal a bad connection.
+type SessionResetter interface {
+	// ResetSession is called while a connection is in the connection
+	// pool. No queries will run on this connection until this method returns.
+	//
+	// If the connection is bad this should return driver.ErrBadConn to prevent
+	// the connection from being returned to the connection pool. Any other
+	// error will be discarded.
+	ResetSession(ctx context.Context) error
 }
 
 // Result is the result of a query execution.
@@ -215,28 +293,68 @@ type Stmt interface {
 
 	// Exec executes a query that doesn't return rows, such
 	// as an INSERT or UPDATE.
+	//
+	// Deprecated: Drivers should implement StmtExecContext instead (or additionally).
 	Exec(args []Value) (Result, error)
 
 	// Query executes a query that may return rows, such as a
 	// SELECT.
+	//
+	// Deprecated: Drivers should implement StmtQueryContext instead (or additionally).
 	Query(args []Value) (Rows, error)
 }
 
 // StmtExecContext enhances the Stmt interface by providing Exec with context.
 type StmtExecContext interface {
-	// ExecContext must honor the context timeout and return when it is cancelled.
+	// ExecContext executes a query that doesn't return rows, such
+	// as an INSERT or UPDATE.
+	//
+	// ExecContext must honor the context timeout and return when it is canceled.
 	ExecContext(ctx context.Context, args []NamedValue) (Result, error)
 }
 
 // StmtQueryContext enhances the Stmt interface by providing Query with context.
 type StmtQueryContext interface {
-	// QueryContext must honor the context timeout and return when it is cancelled.
+	// QueryContext executes a query that may return rows, such as a
+	// SELECT.
+	//
+	// QueryContext must honor the context timeout and return when it is canceled.
 	QueryContext(ctx context.Context, args []NamedValue) (Rows, error)
+}
+
+// ErrRemoveArgument may be returned from NamedValueChecker to instruct the
+// sql package to not pass the argument to the driver query interface.
+// Return when accepting query specific options or structures that aren't
+// SQL query arguments.
+var ErrRemoveArgument = errors.New("driver: remove argument from query")
+
+// NamedValueChecker may be optionally implemented by Conn or Stmt. It provides
+// the driver more control to handle Go and database types beyond the default
+// Values types allowed.
+//
+// The sql package checks for value checkers in the following order,
+// stopping at the first found match: Stmt.NamedValueChecker, Conn.NamedValueChecker,
+// Stmt.ColumnConverter, DefaultParameterConverter.
+//
+// If CheckNamedValue returns ErrRemoveArgument, the NamedValue will not be included in
+// the final query arguments. This may be used to pass special options to
+// the query itself.
+//
+// If ErrSkip is returned the column converter error checking
+// path is used for the argument. Drivers may wish to return ErrSkip after
+// they have exhausted their own special cases.
+type NamedValueChecker interface {
+	// CheckNamedValue is called before passing arguments to the driver
+	// and is called in place of any ColumnConverter. CheckNamedValue must do type
+	// validation and conversion as appropriate for the driver.
+	CheckNamedValue(*NamedValue) error
 }
 
 // ColumnConverter may be optionally implemented by Stmt if the
 // statement is aware of its own columns' types and can convert from
 // any type to a driver Value.
+//
+// Deprecated: Drivers should implement NamedValueChecker.
 type ColumnConverter interface {
 	// ColumnConverter returns a ValueConverter for the provided
 	// column index. If the type of a specific column isn't known
@@ -261,6 +379,10 @@ type Rows interface {
 	// size as the Columns() are wide.
 	//
 	// Next should return io.EOF when there are no more rows.
+	//
+	// The dest should not be written to outside of Next. Care
+	// should be taken when closing Rows not to modify
+	// a buffer held in dest.
 	Next(dest []Value) error
 }
 

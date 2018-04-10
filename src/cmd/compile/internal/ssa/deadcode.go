@@ -6,16 +6,17 @@ package ssa
 
 // findlive returns the reachable blocks and live values in f.
 func findlive(f *Func) (reachable []bool, live []bool) {
-	reachable = reachableBlocks(f)
+	reachable = ReachableBlocks(f)
 	live = liveValues(f, reachable)
 	return
 }
 
-// reachableBlocks returns the reachable blocks in f.
-func reachableBlocks(f *Func) []bool {
+// ReachableBlocks returns the reachable blocks in f.
+func ReachableBlocks(f *Func) []bool {
 	reachable := make([]bool, f.NumBlocks())
 	reachable[f.Entry.ID] = true
-	p := []*Block{f.Entry} // stack-like worklist
+	p := make([]*Block, 0, 64) // stack-like worklist
+	p = append(p, f.Entry)
 	for len(p) > 0 {
 		// Pop a reachable block
 		b := p[len(p)-1]
@@ -27,6 +28,9 @@ func reachableBlocks(f *Func) []bool {
 		}
 		for _, e := range s {
 			c := e.b
+			if int(c.ID) >= len(reachable) {
+				f.Fatalf("block %s >= f.NumBlocks()=%d?", c, len(reachable))
+			}
 			if !reachable[c.ID] {
 				reachable[c.ID] = true
 				p = append(p, c) // push
@@ -51,7 +55,7 @@ func liveValues(f *Func, reachable []bool) []bool {
 	}
 
 	// Find all live values
-	var q []*Value // stack-like worklist of unscanned values
+	q := make([]*Value, 0, 64) // stack-like worklist of unscanned values
 
 	// Starting set: all control values of reachable blocks are live.
 	// Calls are live (because callee can observe the memory state).
@@ -64,7 +68,7 @@ func liveValues(f *Func, reachable []bool) []bool {
 			q = append(q, v)
 		}
 		for _, v := range b.Values {
-			if opcodeTable[v.Op].call && !live[v.ID] {
+			if (opcodeTable[v.Op].call || opcodeTable[v.Op].hasSideEffects) && !live[v.ID] {
 				live[v.ID] = true
 				q = append(q, v)
 			}
@@ -106,7 +110,7 @@ func deadcode(f *Func) {
 	}
 
 	// Find reachable blocks.
-	reachable := reachableBlocks(f)
+	reachable := ReachableBlocks(f)
 
 	// Get rid of edges from dead to live code.
 	for _, b := range f.Blocks {

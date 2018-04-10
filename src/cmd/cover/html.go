@@ -15,6 +15,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // htmlOutput reads the profile data from profile and generates an HTML
@@ -41,7 +42,7 @@ func htmlOutput(profile, outfile string) error {
 		if err != nil {
 			return fmt.Errorf("can't read %q: %v", fn, err)
 		}
-		var buf bytes.Buffer
+		var buf strings.Builder
 		err = htmlGen(&buf, src, profile.Boundaries(src))
 		if err != nil {
 			return err
@@ -64,9 +65,12 @@ func htmlOutput(profile, outfile string) error {
 	} else {
 		out, err = os.Create(outfile)
 	}
+	if err != nil {
+		return err
+	}
 	err = htmlTemplate.Execute(out, d)
-	if err == nil {
-		err = out.Close()
+	if err2 := out.Close(); err == nil {
+		err = err2
 	}
 	if err != nil {
 		return err

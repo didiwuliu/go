@@ -6,7 +6,10 @@
 
 package os
 
-import "syscall"
+import (
+	"internal/testlog"
+	"syscall"
+)
 
 // Expand replaces ${var} or $var in the string based on the mapping function.
 // For example, os.ExpandEnv(s) is equivalent to os.Expand(s, os.Getenv).
@@ -18,7 +21,12 @@ func Expand(s string, mapping func(string) string) string {
 		if s[j] == '$' && j+1 < len(s) {
 			buf = append(buf, s[i:j]...)
 			name, w := getShellName(s[j+1:])
-			buf = append(buf, mapping(name)...)
+			// If the name is empty, keep the $.
+			if name == "" {
+				buf = append(buf, s[j])
+			} else {
+				buf = append(buf, mapping(name)...)
+			}
 			j += w
 			i = j + 1
 		}
@@ -78,6 +86,7 @@ func getShellName(s string) (string, int) {
 // It returns the value, which will be empty if the variable is not present.
 // To distinguish between an empty value and an unset value, use LookupEnv.
 func Getenv(key string) string {
+	testlog.Getenv(key)
 	v, _ := syscall.Getenv(key)
 	return v
 }
@@ -88,6 +97,7 @@ func Getenv(key string) string {
 // Otherwise the returned value will be empty and the boolean will
 // be false.
 func LookupEnv(key string) (string, bool) {
+	testlog.Getenv(key)
 	return syscall.Getenv(key)
 }
 

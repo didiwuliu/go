@@ -18,6 +18,8 @@
 // with v1.5/OAEP and signing/verifying with v1.5/PSS. If one needs to abstract
 // over the public-key primitive, the PrivateKey struct implements the
 // Decrypter and Signer interfaces from the crypto package.
+//
+// The RSA operations in this package are not implemented using constant-time algorithms.
 package rsa
 
 import (
@@ -38,6 +40,12 @@ var bigOne = big.NewInt(1)
 type PublicKey struct {
 	N *big.Int // modulus
 	E int      // public exponent
+}
+
+// Size returns the modulus size in bytes. Raw signatures and ciphertexts
+// for or by this public key will have the same size.
+func (pub *PublicKey) Size() int {
+	return (pub.N.BitLen() + 7) / 8
 }
 
 // OAEPOptions is an interface for passing options to OAEP decryption using the
@@ -90,17 +98,19 @@ func (priv *PrivateKey) Public() crypto.PublicKey {
 	return &priv.PublicKey
 }
 
-// Sign signs msg with priv, reading randomness from rand. If opts is a
+// Sign signs digest with priv, reading randomness from rand. If opts is a
 // *PSSOptions then the PSS algorithm will be used, otherwise PKCS#1 v1.5 will
-// be used. This method is intended to support keys where the private part is
-// kept in, for example, a hardware module. Common uses should use the Sign*
-// functions in this package.
-func (priv *PrivateKey) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+// be used.
+//
+// This method implements crypto.Signer, which is an interface to support keys
+// where the private part is kept in, for example, a hardware module. Common
+// uses should use the Sign* functions in this package directly.
+func (priv *PrivateKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	if pssOpts, ok := opts.(*PSSOptions); ok {
-		return SignPSS(rand, priv, pssOpts.Hash, msg, pssOpts)
+		return SignPSS(rand, priv, pssOpts.Hash, digest, pssOpts)
 	}
 
-	return SignPKCS1v15(rand, priv, opts.HashFunc(), msg)
+	return SignPKCS1v15(rand, priv, opts.HashFunc(), digest)
 }
 
 // Decrypt decrypts ciphertext with priv. If opts is nil or of type
@@ -369,7 +379,7 @@ func EncryptOAEP(hash hash.Hash, random io.Reader, pub *PublicKey, msg []byte, l
 		return nil, err
 	}
 	hash.Reset()
-	k := (pub.N.BitLen() + 7) / 8
+	k := pub.Size()
 	if len(msg) > k-2*hash.Size()-2 {
 		return nil, ErrMessageTooLong
 	}
@@ -422,8 +432,7 @@ var ErrVerification = errors.New("crypto/rsa: verification error")
 func modInverse(a, n *big.Int) (ia *big.Int, ok bool) {
 	g := new(big.Int)
 	x := new(big.Int)
-	y := new(big.Int)
-	g.GCD(x, y, a, n)
+	g.GCD(x, nil, a, n)
 	if g.Cmp(bigOne) != 0 {
 		// In this case, a and n aren't coprime and we cannot calculate
 		// the inverse. This happens because the values of n are nearly
@@ -584,7 +593,7 @@ func DecryptOAEP(hash hash.Hash, random io.Reader, priv *PrivateKey, ciphertext 
 	if err := checkPub(&priv.PublicKey); err != nil {
 		return nil, err
 	}
-	k := (priv.N.BitLen() + 7) / 8
+	k := priv.Size()
 	if len(ciphertext) > k ||
 		k < hash.Size()*2+2 {
 		return nil, ErrDecryption

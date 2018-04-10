@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux netbsd openbsd dragonfly nacl
+// +build linux netbsd dragonfly nacl
 
 package os
 
@@ -19,12 +19,10 @@ var executablePath, executablePathErr = func() (string, error) {
 	switch runtime.GOOS {
 	default:
 		return "", errors.New("Executable not implemented for " + runtime.GOOS)
-	case "linux":
+	case "linux", "android":
 		procfn = "/proc/self/exe"
 	case "netbsd":
 		procfn = "/proc/curproc/exe"
-	case "openbsd":
-		procfn = "/proc/curproc/file"
 	case "dragonfly":
 		procfn = "/proc/curproc/file"
 	}

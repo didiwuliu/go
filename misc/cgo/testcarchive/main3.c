@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <sched.h>
+#include <unistd.h>
 
 #include "libgo3.h"
 
@@ -25,6 +26,31 @@ static void ioHandler(int signo, siginfo_t* info, void* ctxt) {
 	sigioSeen = 1;
 }
 
+// Set up the SIGPIPE signal handler in a high priority constructor, so
+// that it is installed before the Go code starts.
+
+static void pipeHandler(int signo, siginfo_t* info, void* ctxt) {
+	const char *s = "unexpected SIGPIPE\n";
+	write(2, s, strlen(s));
+	exit(EXIT_FAILURE);
+}
+
+static void init(void) __attribute__ ((constructor (200)));
+
+static void init() {
+    struct sigaction sa;
+
+	memset(&sa, 0, sizeof sa);
+	sa.sa_sigaction = pipeHandler;
+	if (sigemptyset(&sa.sa_mask) < 0) {
+		die("sigemptyset");
+	}
+	sa.sa_flags = SA_SIGINFO;
+	if (sigaction(SIGPIPE, &sa, NULL) < 0) {
+		die("sigaction");
+	}
+}
+
 int main(int argc, char** argv) {
 	int verbose;
 	struct sigaction sa;
@@ -33,6 +59,14 @@ int main(int argc, char** argv) {
 
 	verbose = argc > 2;
 	setvbuf(stdout, NULL, _IONBF, 0);
+
+	if (verbose) {
+		printf("raising SIGPIPE\n");
+	}
+
+	// Test that the Go runtime handles SIGPIPE, even if we installed
+	// a non-default SIGPIPE handler before the runtime initializes.
+	ProvokeSIGPIPE();
 
 	if (verbose) {
 		printf("calling sigaction\n");
@@ -70,7 +104,7 @@ int main(int argc, char** argv) {
 		ts.tv_nsec = 1000000;
 		nanosleep(&ts, NULL);
 		i++;
-		if (i > 100000) {
+		if (i > 5000) {
 			fprintf(stderr, "looping too long waiting for signal\n");
 			exit(EXIT_FAILURE);
 		}
@@ -144,7 +178,7 @@ int main(int argc, char** argv) {
 		ts.tv_nsec = 1000000;
 		nanosleep(&ts, NULL);
 		i++;
-		if (i > 100000) {
+		if (i > 5000) {
 			fprintf(stderr, "looping too long waiting for signal\n");
 			exit(EXIT_FAILURE);
 		}
